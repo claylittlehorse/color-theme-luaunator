@@ -29,31 +29,6 @@ struct ThemeEntry {
     path: String,
 }
 
-#[derive(Deserialize, Debug)]
-struct Theme {
-    colors: HashMap<String, String>, // Map for "colors" key
-    tokenColors: Vec<TokenColor>,    // List of token colors
-}
-
-#[derive(Deserialize, Debug)]
-struct TokenColor {
-    settings: RawSettings,
-}
-
-#[derive(Deserialize, Debug)]
-struct RawSettings {
-    foreground: Option<String>,
-    background: Option<String>,
-    fontStyle: Option<String>, // Optional field
-}
-
-#[derive(Debug, PartialEq, Eq, Hash)]
-struct Settings {
-    foreground: Option<String>,
-    background: Option<String>,
-    font_style: Vec<String>,
-}
-
 fn normalize_path(raw_path: &str) -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -89,19 +64,19 @@ fn get_stdin_filepath_with_reprompt_backup() -> String {
     input
 }
 
-fn read_extensions_json(file_path: &PathBuf) -> Vec<Extension> {
+fn read_extensions_json_with_filepath_prompt_backup(file_path: &PathBuf) -> Vec<Extension> {
     match fs::read_to_string(file_path) {
         Ok(json_content) => {
             serde_json::from_str(&json_content).expect("Failed to parse extensions.json")
         }
         Err(e) => {
             eprintln!(
-                "Failed to read extensions.json: '{}'. Please provide the correct path to your .vscode/extensions/extensions.json file:",
+                "Failed to read extensions.json: '{}'. Please provide the path to your .vscode/extensions/extensions.json file:",
                 e
             );
             let input = get_stdin_filepath_with_reprompt_backup();
             let input_path = PathBuf::from(input.trim());
-            read_extensions_json(&input_path)
+            read_extensions_json_with_filepath_prompt_backup(&input_path)
         }
     }
 }
@@ -334,14 +309,6 @@ fn get_hue_by_label(label: &str) -> f32 {
     }
 }
 
-struct StyleSetting {
-    // color_name: &'static str,
-    count: usize,
-    foreground: Option<String>,
-    background: Option<String>,
-    font_style: Vec<String>,
-}
-
 fn main() {
     let file_path = if cfg!(target_os = "windows") {
         PathBuf::from(format!(
@@ -354,7 +321,11 @@ fn main() {
         panic!("Unsupported platform");
     };
 
-    let extensions = read_extensions_json(&file_path);
+    let extensions = read_extensions_json_with_filepath_prompt_backup(&file_path);
+
+    println!(
+        "Found '.vscode/extensions/extensions.json'. Parsing themes from extensions' package.json."
+    );
 
     let mut all_theme_entries: Vec<ThemeEntry> = Vec::new();
 
@@ -385,78 +356,8 @@ fn main() {
             let background_color = theme.colors.get("editor.background");
 
             // HashMap to track unique settings and their counts
-            let mut settings_count: HashMap<Settings, usize> = HashMap::new();
 
             // Iterate over token colors and count unique settings
-            for token_color in theme.tokenColors {
-                if let None = token_color.settings.foreground {
-                    continue;
-                }
-
-                let mut font_style: Vec<String> = token_color
-                    .settings
-                    .fontStyle
-                    .as_deref()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect();
-
-                font_style.sort();
-
-                if font_style.len() == 1 && font_style[0] == "normal" {
-                    font_style.clear();
-                }
-
-                let settings = Settings {
-                    background: token_color.settings.background.clone(),
-                    foreground: token_color.settings.foreground.clone(),
-                    font_style,
-                };
-
-                *settings_count.entry(settings).or_insert(0) += 1;
-            }
-
-            let mut style_hash: HashMap<&'static str, Vec<StyleSetting>> = HashMap::new();
-
-            for (settings, count) in &settings_count {
-                let label = if let Some(foreground) = &settings.foreground {
-                    if let Some((hue, sat, _)) = hex_to_hsb(foreground) {
-                        label_color_by_hue_sat(hue, sat)
-                    } else {
-                        "BMisc"
-                    }
-                } else {
-                    "AMisc"
-                };
-
-                let entry = style_hash.entry(label).or_insert_with(Vec::new);
-
-                entry.push(StyleSetting {
-                    count: *count,
-                    foreground: settings.foreground.clone(),
-                    background: settings.background.clone(),
-                    font_style: settings.font_style.clone(),
-                });
-            }
-
-            for (_, style_settings) in style_hash.iter_mut() {
-                style_settings.sort_by(|a, b| b.count.cmp(&a.count));
-            }
-
-            // Sort the categories by their hue
-            let mut sorted_categories: Vec<(&str, &Vec<StyleSetting>)> = style_hash
-                .iter()
-                .map(|(&key, value)| (key, value))
-                .collect();
-
-            sorted_categories.sort_by(|(category_a, _), (category_b, _)| {
-                let hue_a = get_hue_by_label(&category_a);
-                let hue_b = get_hue_by_label(&category_b);
-                hue_a
-                    .partial_cmp(&hue_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
 
             // Print the sorted categories and their settings
             for (category, style_settings) in sorted_categories {
@@ -572,6 +473,532 @@ fn main() {
         }
     }
 }
+
+#[derive(PartialEq, Eq, Hash)]
+struct StyleSettings {
+    foreground: Option<usize>,
+    background: Option<usize>,
+    font_style: u8,
+}
+
+struct ParsedTheme {
+    theme_json: serde_json::Value,
+    background_color_idx: Option<usize>,
+    source_style: Option<StyleSettings>,
+    theme_trie: ThemeTrie,
+    semantic_theme_trie: Option<ThemeTrie>,
+}
+
+macro_rules! extract_value {
+    ($json:expr, $key:expr, $method:ident) => {
+        $json.get($key).and_then(|value| value.$method())
+    };
+}
+
+macro_rules! extract_string {
+    ($json:expr, $key:expr) => {
+        $json
+            .get($key)
+            .and_then(|value| value.as_str())
+            .map(|s| s.to_string())
+    };
+}
+
+fn parse_theme(theme_entry: &ThemeEntry) -> Option<ParsedTheme> {
+    match fs::read_to_string(&theme_entry.path) {
+        Err(e) => {
+            eprintln!(
+                "Failed to load `{}` for theme `{}`: {}",
+                theme_entry.path, theme_entry.label, e
+            );
+            None
+        }
+        Ok(theme_json) => {
+            // Parse with json5 in case someone put comments in their theme. (I'm someone)
+            let theme_json: serde_json::Value =
+                json5::from_str(&theme_json).expect("Failed to parse JSON");
+
+            let mut color_map = Vec::new();
+            let mut color_hash = HashMap::new();
+
+            let background_color_idx = theme_json.get("colors").and_then(|value| {
+                extract_string!(value, "editor.background")
+                    .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash))
+            });
+
+            let token_colors_array = extract_value!(&theme_json, "token_colors", as_array);
+
+            let mut theme_trie = ThemeTrie::new();
+            if let Some(token_colors_array) = token_colors_array {
+                for token_color in token_colors_array {
+                    if let Some(settings) = token_color.get("settings") {
+                        let font_style =
+                            extract_string!(settings, "fontStyle").unwrap_or("".to_string());
+
+                        let foreground_index =
+                            extract_string!(settings, "foreground").map(|color| {
+                                get_or_insert_color(&color, &mut color_map, &mut color_hash)
+                            });
+                        let background_index =
+                            extract_string!(settings, "background").map(|color| {
+                                get_or_insert_color(&color, &mut color_map, &mut color_hash)
+                            });
+
+                        if let Some(scope_value) = token_color.get("scope") {
+                            let scope_patterns = parse_scope_patterns(scope_value);
+
+                            for scope_pattern in scope_patterns {
+                                let segments: Vec<&str> =
+                                    scope_pattern.split_whitespace().collect();
+
+                                if let Some((scope, parent_scopes)) =
+                                    extract_scope_and_parents(&segments)
+                                {
+                                    theme_trie.insert(
+                                        scope,
+                                        parent_scopes,
+                                        &font_style,
+                                        foreground_index,
+                                        background_index,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                return None;
+            }
+
+            let semantic_token_colors = theme_json
+                .get("semanticTokenColors")
+                .and_then(|value| value.as_object());
+
+            let semantic_theme_trie = if semantic_token_colors.is_some()
+                && theme_json
+                    .get("semanticHighlighting")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+            {
+                let mut semantic_theme_trie = ThemeTrie::new();
+
+                for (scope_pattern, settings) in semantic_token_colors.unwrap() {
+                    let font_style =
+                        extract_string!(settings, "fontStyle").unwrap_or("".to_string());
+
+                    let foreground_index = extract_string!(settings, "foreground")
+                        .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash));
+                    let background_index = extract_string!(settings, "background")
+                        .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash));
+
+                    let segments: Vec<&str> = scope_pattern.split_whitespace().collect();
+
+                    if let Some((scope, parent_scopes)) = extract_scope_and_parents(&segments) {
+                        semantic_theme_trie.insert(
+                            scope,
+                            parent_scopes,
+                            &font_style,
+                            foreground_index,
+                            background_index,
+                        );
+                    }
+                }
+
+                Some(semantic_theme_trie)
+            } else {
+                None
+            };
+
+            theme_trie.match_scope("source");
+
+            Some(ParsedTheme {
+                theme_json,
+                background_color_idx,
+                source_style: None,
+                theme_trie,
+                semantic_theme_trie,
+            })
+        }
+    }
+}
+
+fn parse_scope_patterns(scope_value: &serde_json::Value) -> Vec<String> {
+    let mut scope_patterns = Vec::new();
+
+    if let Some(scope_str) = scope_value.as_str() {
+        scope_patterns.extend(
+            scope_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        );
+    } else if let Some(scope_array) = scope_value.as_array() {
+        for scope_item in scope_array {
+            if let Some(scope_str) = scope_item.as_str() {
+                scope_patterns.extend(
+                    scope_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty()),
+                );
+            }
+        }
+    }
+
+    scope_patterns
+}
+
+fn extract_scope_and_parents<'a>(segments: &'a [&'a str]) -> Option<(&'a str, Vec<String>)> {
+    if segments.is_empty() {
+        return None;
+    }
+
+    let scope = segments.last().unwrap();
+    let parent_scopes = if segments.len() > 1 {
+        segments[..segments.len() - 1]
+            .iter()
+            .rev()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Some((scope, parent_scopes))
+}
+
+#[derive(Debug, Clone)]
+struct ThemeTrieRule {
+    scope_depth: usize,
+    font_style: u8,
+    foreground: Option<usize>,
+    background: Option<usize>,
+    parent_scopes: Vec<String>,
+}
+
+fn scope_path_matches_parent_scopes(scope_path: &[&str], parent_scopes: &[String]) -> bool {
+    if parent_scopes.is_empty() {
+        return true;
+    }
+
+    let mut scope_path_index = scope_path.len();
+    let mut parent_index = parent_scopes.len();
+
+    while parent_index > 0 {
+        parent_index -= 1;
+        let mut parent_scope = &parent_scopes[parent_index];
+        let mut strict_match = false;
+
+        if parent_scope == ">" {
+            if parent_index == 0 {
+                return false;
+            }
+            parent_index -= 1;
+            parent_scope = &parent_scopes[parent_index];
+            strict_match = true;
+        }
+
+        while scope_path_index > 0 {
+            scope_path_index -= 1;
+            if scope_path[scope_path_index] == parent_scope {
+                break;
+            }
+            if strict_match {
+                return false;
+            }
+        }
+
+        if scope_path_index == 0 {
+            return false;
+        }
+    }
+
+    true
+}
+
+#[derive(Debug)]
+struct ThemeTrieNode {
+    main_rule: ThemeTrieRule,
+    rules_with_parent_scopes: Vec<ThemeTrieRule>,
+    children: HashMap<String, ThemeTrieNode>,
+}
+
+impl ThemeTrieNode {
+    fn new() -> Self {
+        ThemeTrieNode {
+            main_rule: ThemeTrieRule {
+                scope_depth: 0,
+                font_style: 0,
+                foreground: None,
+                background: None,
+                parent_scopes: Vec::new(),
+            },
+            rules_with_parent_scopes: Vec::new(),
+            children: HashMap::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        scope: &str,
+        parent_scopes: Vec<String>,
+        font_style: &str,
+        foreground_index: Option<usize>,
+        background_index: Option<usize>,
+        depth: usize,
+    ) {
+        if scope.is_empty() {
+            self.insert_here(
+                depth,
+                parent_scopes,
+                font_style,
+                foreground_index,
+                background_index,
+            );
+            return;
+        }
+
+        let (head, tail) = if let Some(dot_index) = scope.find('.') {
+            (&scope[..dot_index], &scope[dot_index + 1..])
+        } else {
+            (scope, "")
+        };
+
+        let child = self
+            .children
+            .entry(head.to_string())
+            .or_insert_with(ThemeTrieNode::new);
+
+        child.insert(
+            tail,
+            parent_scopes,
+            font_style,
+            foreground_index,
+            background_index,
+            depth + 1,
+        );
+    }
+
+    fn insert_here(
+        &mut self,
+        scope_depth: usize,
+        parent_scopes: Vec<String>,
+        font_style: &str,
+        foreground_index: Option<usize>,
+        background_index: Option<usize>,
+    ) {
+        let font_style_flags = parse_font_style(font_style);
+
+        if parent_scopes.is_empty() {
+            self.main_rule = ThemeTrieRule {
+                scope_depth,
+                font_style: font_style_flags,
+                foreground: foreground_index,
+                background: background_index,
+                parent_scopes: Vec::new(),
+            };
+        } else {
+            for rule in &mut self.rules_with_parent_scopes {
+                if rule.parent_scopes == parent_scopes {
+                    rule.scope_depth = scope_depth;
+                    rule.font_style |= font_style_flags;
+                    if foreground_index.is_some() {
+                        rule.foreground = foreground_index;
+                    }
+                    if background_index.is_some() {
+                        rule.background = background_index;
+                    }
+                    return;
+                }
+            }
+
+            self.rules_with_parent_scopes.push(ThemeTrieRule {
+                scope_depth,
+                font_style: font_style_flags,
+                foreground: foreground_index,
+                background: background_index,
+                parent_scopes,
+            });
+        }
+    }
+
+    fn match_scope(&self, scope: &str) -> Vec<ThemeTrieRule> {
+        if !scope.is_empty() {
+            if let Some(dot_index) = scope.find('.') {
+                let head = &scope[..dot_index];
+                let tail = &scope[dot_index + 1..];
+
+                if let Some(child) = self.children.get(head) {
+                    return child.match_scope(tail);
+                }
+            } else {
+                if let Some(child) = self.children.get(scope) {
+                    return child.match_scope("");
+                }
+            }
+        }
+
+        let mut rules = self.rules_with_parent_scopes.clone();
+        rules.push(self.main_rule.clone());
+
+        rules.sort_by(|a, b| ThemeTrieNode::compare_rules(a, b));
+        rules
+    }
+
+    fn compare_rules(a: &ThemeTrieRule, b: &ThemeTrieRule) -> std::cmp::Ordering {
+        if a.scope_depth != b.scope_depth {
+            return b.scope_depth.cmp(&a.scope_depth);
+        }
+
+        let mut a_parent_index = 0;
+        let mut b_parent_index = 0;
+
+        while a_parent_index < a.parent_scopes.len() && b_parent_index < b.parent_scopes.len() {
+            // Child combinators don't affect specificity.
+            if a.parent_scopes[a_parent_index] == ">" {
+                a_parent_index += 1;
+                continue;
+            }
+            if b.parent_scopes[b_parent_index] == ">" {
+                b_parent_index += 1;
+                continue;
+            }
+
+            let parent_scope_length_diff = b.parent_scopes[b_parent_index]
+                .len()
+                .cmp(&a.parent_scopes[a_parent_index].len());
+            if parent_scope_length_diff != std::cmp::Ordering::Equal {
+                return parent_scope_length_diff;
+            }
+
+            a_parent_index += 1;
+            b_parent_index += 1;
+        }
+
+        b.parent_scopes.len().cmp(&a.parent_scopes.len())
+    }
+}
+
+fn parse_font_style(font_style: &str) -> u8 {
+    let mut flags = 0;
+    for style in font_style.split_whitespace() {
+        match style {
+            "bold" => flags |= 0b00000001,
+            "italic" => flags |= 0b00000010,
+            "underline" => flags |= 0b00000100,
+            "strikethrough" => flags |= 0b00001000,
+            _ => {}
+        }
+    }
+    flags
+}
+
+fn get_or_insert_color(
+    color: &str,
+    color_map: &mut Vec<String>,
+    color_hash: &mut HashMap<String, usize>,
+) -> usize {
+    if let Some(&index) = color_hash.get(color) {
+        index
+    } else {
+        let index = color_map.len();
+        color_map.push(color.to_string());
+        color_hash.insert(color.to_string(), index);
+        index
+    }
+}
+
+#[derive(Debug)]
+struct ThemeTrie {
+    root: ThemeTrieNode,
+}
+
+impl ThemeTrie {
+    fn new() -> Self {
+        ThemeTrie {
+            root: ThemeTrieNode::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        scope: &str,
+        parent_scopes: Vec<String>,
+        font_style: &str,
+        foreground_index: Option<usize>,
+        background_index: Option<usize>,
+    ) {
+        self.root.insert(
+            scope,
+            parent_scopes,
+            font_style,
+            foreground_index,
+            background_index,
+            0,
+        );
+    }
+
+    fn match_scope(&self, scope_path: &str) -> Option<ThemeTrieRule> {
+        let segments: Vec<&str> = scope_path.split('.').collect();
+        let final_scope = segments.last().unwrap_or(&"");
+
+        let matching_rules = self.root.match_scope(final_scope);
+
+        let matching_rule = matching_rules.into_iter().find(|rule| {
+            let reversed_parent_scopes: Vec<String> =
+                rule.parent_scopes.iter().rev().cloned().collect();
+            scope_path_matches_parent_scopes(&segments, &reversed_parent_scopes)
+        });
+
+        matching_rule
+    }
+}
+
+// let mut semantic_theme_trie = if ectract_value!(settings, "semanticHighlighting", as)
+//     let mut settings_occurences: HashMap<Settings, usize> = HashMap::new();
+
+//     let mut style_hash: HashMap<&'static str, Vec<StyleSetting>> = HashMap::new();
+//     for (settings, setting_info) in &settings_hash {
+//         let label = match &settings.foreground {
+//             Some(foreground) => match hex_to_hsb(foreground) {
+//                 Some((hue, sat, _)) => label_color_by_hue_sat(hue, sat),
+//                 None => "Misc",
+//             },
+//             None => "Misc",
+//         };
+
+//         let entry = style_hash.entry(label).or_insert_with(Vec::new);
+
+//         entry.push(StyleSetting {
+//             occurences: setting_info.occurences,
+//             foreground: settings.foreground.clone(),
+//             background: settings.background.clone(),
+//             font_style: settings.font_style.clone(),
+//         });
+//     }
+
+//     for (_, style_settings) in style_hash.iter_mut() {
+//         style_settings.sort_by(|a, b| b.occurences.cmp(&a.occurences));
+//     }
+
+//     // Sort the categories by their hue
+//     let mut sorted_categories: Vec<(&str, &Vec<StyleSetting>)> = style_hash
+//         .iter()
+//         .map(|(&key, value)| (key, value))
+//         .collect();
+
+//     sorted_categories.sort_by(|(category_a, _), (category_b, _)| {
+//         let hue_a = get_hue_by_label(&category_a);
+//         let hue_b = get_hue_by_label(&category_b);
+//         hue_a
+//             .partial_cmp(&hue_b)
+//             .unwrap_or(std::cmp::Ordering::Equal)
+//     });
+
+//     None
+// } else {
+//     None
+// }
 
 // [function definition]
 // meta.function
