@@ -1,7 +1,10 @@
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+mod theme_parser;
+use theme_parser::{FontStyle, ParsedTheme, ThemeEntry, ThemeTrieRule, parse_theme};
 
 #[derive(Deserialize, Debug)]
 struct Location {
@@ -21,12 +24,6 @@ struct Package {
 #[derive(Deserialize, Debug)]
 struct Contributes {
     themes: Option<Vec<ThemeEntry>>,
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct ThemeEntry {
-    label: String,
-    path: String,
 }
 
 fn normalize_path(raw_path: &str) -> PathBuf {
@@ -143,41 +140,54 @@ fn prompt_theme_select_input_with_reprompt_backup(themes_length: usize) -> Input
     }
 }
 
-fn select_theme(theme_entries: Vec<ThemeEntry>, filter: Option<String>) -> ThemeEntry {
-    let filtered_theme_entries: Vec<ThemeEntry> = if let Some(filter_str) = &filter {
-        theme_entries
-            .iter()
-            .filter(|theme| {
-                theme
-                    .label
-                    .to_lowercase()
-                    .contains(&filter_str.to_lowercase())
-            })
-            .cloned()
-            .collect()
-    } else {
-        theme_entries.iter().cloned().collect()
-    };
+fn select_theme(parsed_themes: &Vec<ParsedTheme>, filter: Option<String>) -> usize {
+    let mut filtered_themes: Vec<(&str, &Option<ThemeTrieRule>, usize)> = Vec::new();
 
-    if filtered_theme_entries.is_empty() {
-        println!("No themes match provided filter string. Press enter to continue...");
+    for (index, parsed_theme) in parsed_themes.iter().enumerate() {
+        if let Some(filter_str) = &filter {
+            if parsed_theme
+                .label
+                .to_lowercase()
+                .contains(&filter_str.to_lowercase())
+            {
+                filtered_themes.push((&parsed_theme.label, &parsed_theme.source_style, index));
+            }
+        } else {
+            filtered_themes.push((&parsed_theme.label, &parsed_theme.source_style, index));
+        }
+    }
+
+    if filtered_themes.is_empty() {
+        println!("No themes match the provided filter string. Press enter to continue...");
         let mut input = String::new();
         let _ = std::io::stdin().read_line(&mut input);
-        return select_theme(theme_entries, None);
+        return select_theme(parsed_themes, None);
     } else {
-        for (theme_index, theme) in filtered_theme_entries.iter().enumerate() {
-            println!("{}: {}", theme_index + 1, theme.label);
+        for (theme_index, (label, source_style, _)) in filtered_themes.iter().enumerate() {
+            let styled_label = if let Some(source_style) = source_style {
+                format_styled_text(
+                    source_style.font_style,
+                    source_style.foreground,
+                    source_style.background,
+                    &format!("{} {}", label, source_style.scope),
+                )
+            } else {
+                label.to_string() // No styling if `source_style` is None
+            };
+
+            println!("{}: {}", theme_index + 1, styled_label);
         }
+
         println!("== ----- ==");
         println!(
             "Input number [1 - {}] OR `filter [theme name]`",
-            filtered_theme_entries.len()
+            filtered_themes.len()
         )
     }
 
-    match prompt_theme_select_input_with_reprompt_backup(filtered_theme_entries.len()) {
-        InputResult::Filter(filter_string) => select_theme(theme_entries, filter_string),
-        InputResult::ThemeIndex(theme_index) => filtered_theme_entries[theme_index].clone(),
+    match prompt_theme_select_input_with_reprompt_backup(filtered_themes.len()) {
+        InputResult::Filter(filter_string) => select_theme(parsed_themes, filter_string),
+        InputResult::ThemeIndex(theme_index) => filtered_themes[theme_index].2,
     }
 }
 
@@ -327,678 +337,197 @@ fn main() {
         "Found '.vscode/extensions/extensions.json'. Parsing themes from extensions' package.json."
     );
 
-    let mut all_theme_entries: Vec<ThemeEntry> = Vec::new();
+    let mut parsed_themes: Vec<ParsedTheme> = Vec::new();
+    let mut theme_files: Vec<&String> = Vec::new();
 
     for extension in extensions {
         let extension_path = normalize_path(&extension.location.path);
         let theme_entries = read_theme_entries_from_json(&extension_path);
 
         if let Some(theme_entries) = theme_entries {
-            for mut theme_entry in theme_entries {
+            for theme_entry in theme_entries {
                 let absolute_path = extension_path.join(normalize_path(&theme_entry.path));
-                theme_entry.path = absolute_path.to_string_lossy().to_string();
+                let theme_content = match fs::read_to_string(&absolute_path) {
+                    Err(e) => {
+                        eprint!(
+                            "Failed to load `{}` for theme `{}`: {}",
+                            theme_entry.path, theme_entry.label, e
+                        );
+                        continue;
+                    }
+                    Ok(content) => content,
+                };
 
-                all_theme_entries.push(theme_entry);
-            }
-        }
-    }
-
-    let theme_entry = select_theme(all_theme_entries, None);
-
-    match fs::read_to_string(&theme_entry.path) {
-        Err(e) => {
-            eprintln!("Failed to read `{}`: {}", theme_entry.path, e);
-            std::process::exit(0);
-        }
-        Ok(theme_json) => {
-            let theme: Theme = json5::from_str(&theme_json).expect("Failed to parse JSON");
-
-            let background_color = theme.colors.get("editor.background");
-
-            // HashMap to track unique settings and their counts
-
-            // Iterate over token colors and count unique settings
-
-            // Print the sorted categories and their settings
-            for (category, style_settings) in sorted_categories {
-                for (index, style_setting) in style_settings.iter().enumerate() {
-                    let color_name = if style_settings.len() > 1 {
-                        format!("{}{}", category, index + 1)
-                    } else {
-                        category.to_string()
-                    };
-
-                    let mut style_codes = Vec::new();
-                    let mut style_names = Vec::new();
-
-                    for style in &style_setting.font_style {
-                        match style.as_str() {
-                            "bold" => {
-                                style_codes.push("1");
-                                style_names.push("bold");
-                            }
-                            "italic" => {
-                                style_codes.push("3");
-                                style_names.push("italic");
-                            }
-                            "underline" => {
-                                style_codes.push("4");
-                                style_names.push("underline");
-                            }
-                            "strikethrough" => {
-                                style_codes.push("9");
-                                style_names.push("strikethrough");
-                            }
-                            _ => {}
+                let theme_content = Box::leak(Box::new(theme_content));
+                let theme_json = match serde_json::from_str(&theme_content) {
+                    Ok(json) => Box::leak(Box::new(json)),
+                    Err(_) => match json5::from_str(&theme_content) {
+                        Ok(json) => Box::leak(Box::new(json)),
+                        Err(e) => {
+                            eprintln!(
+                                "Failed to parse `{}` for theme `{}` as JSON or JSON5: {}",
+                                theme_entry.path, theme_entry.label, e
+                            );
+                            continue;
                         }
-                    }
+                    },
+                };
 
-                    let mut is_any_ansi = false;
-
-                    let (style_ansi, style_text) = if !style_codes.is_empty() {
-                        is_any_ansi = true;
-                        (
-                            style_codes.join(";") + ";",
-                            format!(" {}", style_names.join(" ")),
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    };
-
-                    let (foreground_ansi, foreground_text, alpha_text) =
-                        if let Some(foreground) = &style_setting.foreground {
-                            is_any_ansi = true;
-                            (
-                                format!("38;2;{}", hex_to_rgb_string(&foreground)),
-                                foreground.clone(),
-                                if let Some((_, _, _, Some(alpha))) = hex_to_rgba(foreground) {
-                                    format!(" alpha: {}", alpha)
-                                } else {
-                                    String::new()
-                                },
-                            )
-                        } else {
-                            (String::new(), String::new(), String::new())
-                        };
-
-                    let background_text = if let Some(background) = &style_setting.background {
-                        format!(" background: {}", background)
-                    } else {
-                        String::new()
-                    };
-
-                    let background_ansi = if let Some(bg) = &style_setting.background {
-                        let bga = format!(
-                            "{}48;2;{}",
-                            if is_any_ansi { ";" } else { "" },
-                            hex_to_rgb_string(&bg)
-                        );
-                        is_any_ansi = true;
-                        bga
-                    } else if let Some(bg) = background_color {
-                        let bga = format!(
-                            "{}48;2;{}",
-                            if is_any_ansi { ";" } else { "" },
-                            hex_to_rgb_string(&bg)
-                        );
-                        is_any_ansi = true;
-                        bga
-                    } else {
-                        String::new()
-                    };
-
-                    let (ansi_format_prefix, ansi_format_suffix) = if is_any_ansi {
-                        (
-                            format!("\x1b[{}{}{}m", style_ansi, foreground_ansi, background_ansi),
-                            "\x1b[0m".to_string(),
-                        )
-                    } else {
-                        (String::new(), String::new())
-                    };
-
-                    print!(
-                        "{}{} ({}{}{}{}){} ",
-                        ansi_format_prefix,
-                        color_name,
-                        foreground_text,
-                        background_text,
-                        style_text,
-                        alpha_text,
-                        ansi_format_suffix
-                    )
+                if let Some(parsed_theme) = parse_theme(theme_json, &theme_entry.label) {
+                    parsed_themes.push(parsed_theme);
+                    theme_files.push(theme_content);
                 }
-
-                println!();
             }
         }
     }
+
+    let selected_theme_idx = select_theme(&parsed_themes, None);
+
+    // println!("Selected theme: {}", selected_theme_idx + 1)
+
+    // match fs::read_to_string(&theme_entry.path) {
+    //     Err(e) => {
+    //         eprintln!("Failed to read `{}`: {}", theme_entry.path, e);
+    //         std::process::exit(0);
+    //     }
+    //     Ok(theme_json) => {
+    //         let theme: Theme = json5::from_str(&theme_json).expect("Failed to parse JSON");
+
+    //         let background_color = theme.colors.get("editor.background");
+
+    //         // HashMap to track unique settings and their counts
+
+    //         // Iterate over token colors and count unique settings
+
+    //         // Print the sorted categories and their settings
+    //         for (category, style_settings) in sorted_categories {
+    //             for (index, style_setting) in style_settings.iter().enumerate() {
+
+    //                 let mut is_any_ansi = false;
+
+    //                 let (style_ansi, style_text) = if !style_codes.is_empty() {
+    //                     is_any_ansi = true;
+    //                     (
+    //                         style_codes.join(";") + ";",
+    //                         format!(" {}", style_names.join(" ")),
+    //                     )
+    //                 } else {
+    //                     (String::new(), String::new())
+    //                 };
+
+    //                 let (foreground_ansi, foreground_text, alpha_text) =
+    //                     if let Some(foreground) = &style_setting.foreground {
+    //                         is_any_ansi = true;
+    //                         (
+    //                             format!("38;2;{}", hex_to_rgb_string(&foreground)),
+    //                             foreground.clone(),
+    //                             if let Some((_, _, _, Some(alpha))) = hex_to_rgba(foreground) {
+    //                                 format!(" alpha: {}", alpha)
+    //                             } else {
+    //                                 String::new()
+    //                             },
+    //                         )
+    //                     } else {
+    //                         (String::new(), String::new(), String::new())
+    //                     };
+
+    //                 let background_text = if let Some(background) = &style_setting.background {
+    //                     format!(" background: {}", background)
+    //                 } else {
+    //                     String::new()
+    //                 };
+
+    //                 let background_ansi = if let Some(bg) = &style_setting.background {
+    //                     let bga = format!(
+    //                         "{}48;2;{}",
+    //                         if is_any_ansi { ";" } else { "" },
+    //                         hex_to_rgb_string(&bg)
+    //                     );
+    //                     is_any_ansi = true;
+    //                     bga
+    //                 } else if let Some(bg) = background_color {
+    //                     let bga = format!(
+    //                         "{}48;2;{}",
+    //                         if is_any_ansi { ";" } else { "" },
+    //                         hex_to_rgb_string(&bg)
+    //                     );
+    //                     is_any_ansi = true;
+    //                     bga
+    //                 } else {
+    //                     String::new()
+    //                 };
+
+    //                 let (ansi_format_prefix, ansi_format_suffix) = if is_any_ansi {
+    //                     (
+    //                         format!("\x1b[{}{}{}m", style_ansi, foreground_ansi, background_ansi),
+    //                         "\x1b[0m".to_string(),
+    //                     )
+    //                 } else {
+    //                     (String::new(), String::new())
+    //                 };
+
+    //                 print!(
+    //                     "{}{} ({}{}{}{}){} ",
+    //                     ansi_format_prefix,
+    //                     color_name,
+    //                     foreground_text,
+    //                     background_text,
+    //                     style_text,
+    //                     alpha_text,
+    //                     ansi_format_suffix
+    //                 )
+    //             }
+
+    //             println!();
+    //         }
+    //     }
+    // }
 }
 
-#[derive(PartialEq, Eq, Hash)]
-struct StyleSettings {
-    foreground: Option<usize>,
-    background: Option<usize>,
+fn format_styled_text(
     font_style: u8,
-}
+    foreground: Option<&str>,
+    background: Option<&str>,
+    text: &str,
+) -> String {
+    let mut style_codes: Vec<String> = Vec::new();
 
-struct ParsedTheme {
-    theme_json: serde_json::Value,
-    background_color_idx: Option<usize>,
-    source_style: Option<StyleSettings>,
-    theme_trie: ThemeTrie,
-    semantic_theme_trie: Option<ThemeTrie>,
-}
-
-macro_rules! extract_value {
-    ($json:expr, $key:expr, $method:ident) => {
-        $json.get($key).and_then(|value| value.$method())
-    };
-}
-
-macro_rules! extract_string {
-    ($json:expr, $key:expr) => {
-        $json
-            .get($key)
-            .and_then(|value| value.as_str())
-            .map(|s| s.to_string())
-    };
-}
-
-fn parse_theme(theme_entry: &ThemeEntry) -> Option<ParsedTheme> {
-    match fs::read_to_string(&theme_entry.path) {
-        Err(e) => {
-            eprintln!(
-                "Failed to load `{}` for theme `{}`: {}",
-                theme_entry.path, theme_entry.label, e
-            );
-            None
-        }
-        Ok(theme_json) => {
-            // Parse with json5 in case someone put comments in their theme. (I'm someone)
-            let theme_json: serde_json::Value =
-                json5::from_str(&theme_json).expect("Failed to parse JSON");
-
-            let mut color_map = Vec::new();
-            let mut color_hash = HashMap::new();
-
-            let background_color_idx = theme_json.get("colors").and_then(|value| {
-                extract_string!(value, "editor.background")
-                    .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash))
-            });
-
-            let token_colors_array = extract_value!(&theme_json, "token_colors", as_array);
-
-            let mut theme_trie = ThemeTrie::new();
-            if let Some(token_colors_array) = token_colors_array {
-                for token_color in token_colors_array {
-                    if let Some(settings) = token_color.get("settings") {
-                        let font_style =
-                            extract_string!(settings, "fontStyle").unwrap_or("".to_string());
-
-                        let foreground_index =
-                            extract_string!(settings, "foreground").map(|color| {
-                                get_or_insert_color(&color, &mut color_map, &mut color_hash)
-                            });
-                        let background_index =
-                            extract_string!(settings, "background").map(|color| {
-                                get_or_insert_color(&color, &mut color_map, &mut color_hash)
-                            });
-
-                        if let Some(scope_value) = token_color.get("scope") {
-                            let scope_patterns = parse_scope_patterns(scope_value);
-
-                            for scope_pattern in scope_patterns {
-                                let segments: Vec<&str> =
-                                    scope_pattern.split_whitespace().collect();
-
-                                if let Some((scope, parent_scopes)) =
-                                    extract_scope_and_parents(&segments)
-                                {
-                                    theme_trie.insert(
-                                        scope,
-                                        parent_scopes,
-                                        &font_style,
-                                        foreground_index,
-                                        background_index,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                return None;
-            }
-
-            let semantic_token_colors = theme_json
-                .get("semanticTokenColors")
-                .and_then(|value| value.as_object());
-
-            let semantic_theme_trie = if semantic_token_colors.is_some()
-                && theme_json
-                    .get("semanticHighlighting")
-                    .and_then(|value| value.as_bool())
-                    .unwrap_or(false)
-            {
-                let mut semantic_theme_trie = ThemeTrie::new();
-
-                for (scope_pattern, settings) in semantic_token_colors.unwrap() {
-                    let font_style =
-                        extract_string!(settings, "fontStyle").unwrap_or("".to_string());
-
-                    let foreground_index = extract_string!(settings, "foreground")
-                        .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash));
-                    let background_index = extract_string!(settings, "background")
-                        .map(|color| get_or_insert_color(&color, &mut color_map, &mut color_hash));
-
-                    let segments: Vec<&str> = scope_pattern.split_whitespace().collect();
-
-                    if let Some((scope, parent_scopes)) = extract_scope_and_parents(&segments) {
-                        semantic_theme_trie.insert(
-                            scope,
-                            parent_scopes,
-                            &font_style,
-                            foreground_index,
-                            background_index,
-                        );
-                    }
-                }
-
-                Some(semantic_theme_trie)
-            } else {
-                None
-            };
-
-            theme_trie.match_scope("source");
-
-            Some(ParsedTheme {
-                theme_json,
-                background_color_idx,
-                source_style: None,
-                theme_trie,
-                semantic_theme_trie,
-            })
-        }
+    // Handle font styles using FontStyle enums
+    if font_style & FontStyle::Bold as u8 != 0 {
+        style_codes.push("1".to_string());
     }
-}
-
-fn parse_scope_patterns(scope_value: &serde_json::Value) -> Vec<String> {
-    let mut scope_patterns = Vec::new();
-
-    if let Some(scope_str) = scope_value.as_str() {
-        scope_patterns.extend(
-            scope_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-        );
-    } else if let Some(scope_array) = scope_value.as_array() {
-        for scope_item in scope_array {
-            if let Some(scope_str) = scope_item.as_str() {
-                scope_patterns.extend(
-                    scope_str
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty()),
-                );
-            }
-        }
+    if font_style & FontStyle::Italic as u8 != 0 {
+        style_codes.push("3".to_string());
+    }
+    if font_style & FontStyle::Underline as u8 != 0 {
+        style_codes.push("4".to_string());
+    }
+    if font_style & FontStyle::Strikethrough as u8 != 0 {
+        style_codes.push("9".to_string());
     }
 
-    scope_patterns
-}
-
-fn extract_scope_and_parents<'a>(segments: &'a [&'a str]) -> Option<(&'a str, Vec<String>)> {
-    if segments.is_empty() {
-        return None;
+    // Handle foreground color
+    if let Some(foreground) = foreground {
+        let formatted_foreground = format!("38;2;{}", hex_to_rgb_string(foreground));
+        style_codes.push(formatted_foreground);
     }
 
-    let scope = segments.last().unwrap();
-    let parent_scopes = if segments.len() > 1 {
-        segments[..segments.len() - 1]
-            .iter()
-            .rev()
-            .map(|s| s.to_string())
-            .collect()
+    // Handle background color
+    if let Some(background) = background {
+        let background_code = format!("48;2;{}", hex_to_rgb_string(background));
+        style_codes.push(background_code);
+    }
+
+    // Build the ANSI style prefix and suffix
+    let (style_prefix, style_suffix) = if !style_codes.is_empty() {
+        (format!("\x1b[{}m", style_codes.join(";")), "\x1b[0m")
     } else {
-        Vec::new()
+        (String::new(), "")
     };
 
-    Some((scope, parent_scopes))
+    // Return the formatted string
+    format!("{}{}{}", style_prefix, text, style_suffix)
 }
-
-#[derive(Debug, Clone)]
-struct ThemeTrieRule {
-    scope_depth: usize,
-    font_style: u8,
-    foreground: Option<usize>,
-    background: Option<usize>,
-    parent_scopes: Vec<String>,
-}
-
-fn scope_path_matches_parent_scopes(scope_path: &[&str], parent_scopes: &[String]) -> bool {
-    if parent_scopes.is_empty() {
-        return true;
-    }
-
-    let mut scope_path_index = scope_path.len();
-    let mut parent_index = parent_scopes.len();
-
-    while parent_index > 0 {
-        parent_index -= 1;
-        let mut parent_scope = &parent_scopes[parent_index];
-        let mut strict_match = false;
-
-        if parent_scope == ">" {
-            if parent_index == 0 {
-                return false;
-            }
-            parent_index -= 1;
-            parent_scope = &parent_scopes[parent_index];
-            strict_match = true;
-        }
-
-        while scope_path_index > 0 {
-            scope_path_index -= 1;
-            if scope_path[scope_path_index] == parent_scope {
-                break;
-            }
-            if strict_match {
-                return false;
-            }
-        }
-
-        if scope_path_index == 0 {
-            return false;
-        }
-    }
-
-    true
-}
-
-#[derive(Debug)]
-struct ThemeTrieNode {
-    main_rule: ThemeTrieRule,
-    rules_with_parent_scopes: Vec<ThemeTrieRule>,
-    children: HashMap<String, ThemeTrieNode>,
-}
-
-impl ThemeTrieNode {
-    fn new() -> Self {
-        ThemeTrieNode {
-            main_rule: ThemeTrieRule {
-                scope_depth: 0,
-                font_style: 0,
-                foreground: None,
-                background: None,
-                parent_scopes: Vec::new(),
-            },
-            rules_with_parent_scopes: Vec::new(),
-            children: HashMap::new(),
-        }
-    }
-
-    fn insert(
-        &mut self,
-        scope: &str,
-        parent_scopes: Vec<String>,
-        font_style: &str,
-        foreground_index: Option<usize>,
-        background_index: Option<usize>,
-        depth: usize,
-    ) {
-        if scope.is_empty() {
-            self.insert_here(
-                depth,
-                parent_scopes,
-                font_style,
-                foreground_index,
-                background_index,
-            );
-            return;
-        }
-
-        let (head, tail) = if let Some(dot_index) = scope.find('.') {
-            (&scope[..dot_index], &scope[dot_index + 1..])
-        } else {
-            (scope, "")
-        };
-
-        let child = self
-            .children
-            .entry(head.to_string())
-            .or_insert_with(ThemeTrieNode::new);
-
-        child.insert(
-            tail,
-            parent_scopes,
-            font_style,
-            foreground_index,
-            background_index,
-            depth + 1,
-        );
-    }
-
-    fn insert_here(
-        &mut self,
-        scope_depth: usize,
-        parent_scopes: Vec<String>,
-        font_style: &str,
-        foreground_index: Option<usize>,
-        background_index: Option<usize>,
-    ) {
-        let font_style_flags = parse_font_style(font_style);
-
-        if parent_scopes.is_empty() {
-            self.main_rule = ThemeTrieRule {
-                scope_depth,
-                font_style: font_style_flags,
-                foreground: foreground_index,
-                background: background_index,
-                parent_scopes: Vec::new(),
-            };
-        } else {
-            for rule in &mut self.rules_with_parent_scopes {
-                if rule.parent_scopes == parent_scopes {
-                    rule.scope_depth = scope_depth;
-                    rule.font_style |= font_style_flags;
-                    if foreground_index.is_some() {
-                        rule.foreground = foreground_index;
-                    }
-                    if background_index.is_some() {
-                        rule.background = background_index;
-                    }
-                    return;
-                }
-            }
-
-            self.rules_with_parent_scopes.push(ThemeTrieRule {
-                scope_depth,
-                font_style: font_style_flags,
-                foreground: foreground_index,
-                background: background_index,
-                parent_scopes,
-            });
-        }
-    }
-
-    fn match_scope(&self, scope: &str) -> Vec<ThemeTrieRule> {
-        if !scope.is_empty() {
-            if let Some(dot_index) = scope.find('.') {
-                let head = &scope[..dot_index];
-                let tail = &scope[dot_index + 1..];
-
-                if let Some(child) = self.children.get(head) {
-                    return child.match_scope(tail);
-                }
-            } else {
-                if let Some(child) = self.children.get(scope) {
-                    return child.match_scope("");
-                }
-            }
-        }
-
-        let mut rules = self.rules_with_parent_scopes.clone();
-        rules.push(self.main_rule.clone());
-
-        rules.sort_by(|a, b| ThemeTrieNode::compare_rules(a, b));
-        rules
-    }
-
-    fn compare_rules(a: &ThemeTrieRule, b: &ThemeTrieRule) -> std::cmp::Ordering {
-        if a.scope_depth != b.scope_depth {
-            return b.scope_depth.cmp(&a.scope_depth);
-        }
-
-        let mut a_parent_index = 0;
-        let mut b_parent_index = 0;
-
-        while a_parent_index < a.parent_scopes.len() && b_parent_index < b.parent_scopes.len() {
-            // Child combinators don't affect specificity.
-            if a.parent_scopes[a_parent_index] == ">" {
-                a_parent_index += 1;
-                continue;
-            }
-            if b.parent_scopes[b_parent_index] == ">" {
-                b_parent_index += 1;
-                continue;
-            }
-
-            let parent_scope_length_diff = b.parent_scopes[b_parent_index]
-                .len()
-                .cmp(&a.parent_scopes[a_parent_index].len());
-            if parent_scope_length_diff != std::cmp::Ordering::Equal {
-                return parent_scope_length_diff;
-            }
-
-            a_parent_index += 1;
-            b_parent_index += 1;
-        }
-
-        b.parent_scopes.len().cmp(&a.parent_scopes.len())
-    }
-}
-
-fn parse_font_style(font_style: &str) -> u8 {
-    let mut flags = 0;
-    for style in font_style.split_whitespace() {
-        match style {
-            "bold" => flags |= 0b00000001,
-            "italic" => flags |= 0b00000010,
-            "underline" => flags |= 0b00000100,
-            "strikethrough" => flags |= 0b00001000,
-            _ => {}
-        }
-    }
-    flags
-}
-
-fn get_or_insert_color(
-    color: &str,
-    color_map: &mut Vec<String>,
-    color_hash: &mut HashMap<String, usize>,
-) -> usize {
-    if let Some(&index) = color_hash.get(color) {
-        index
-    } else {
-        let index = color_map.len();
-        color_map.push(color.to_string());
-        color_hash.insert(color.to_string(), index);
-        index
-    }
-}
-
-#[derive(Debug)]
-struct ThemeTrie {
-    root: ThemeTrieNode,
-}
-
-impl ThemeTrie {
-    fn new() -> Self {
-        ThemeTrie {
-            root: ThemeTrieNode::new(),
-        }
-    }
-
-    fn insert(
-        &mut self,
-        scope: &str,
-        parent_scopes: Vec<String>,
-        font_style: &str,
-        foreground_index: Option<usize>,
-        background_index: Option<usize>,
-    ) {
-        self.root.insert(
-            scope,
-            parent_scopes,
-            font_style,
-            foreground_index,
-            background_index,
-            0,
-        );
-    }
-
-    fn match_scope(&self, scope_path: &str) -> Option<ThemeTrieRule> {
-        let segments: Vec<&str> = scope_path.split('.').collect();
-        let final_scope = segments.last().unwrap_or(&"");
-
-        let matching_rules = self.root.match_scope(final_scope);
-
-        let matching_rule = matching_rules.into_iter().find(|rule| {
-            let reversed_parent_scopes: Vec<String> =
-                rule.parent_scopes.iter().rev().cloned().collect();
-            scope_path_matches_parent_scopes(&segments, &reversed_parent_scopes)
-        });
-
-        matching_rule
-    }
-}
-
-// let mut semantic_theme_trie = if ectract_value!(settings, "semanticHighlighting", as)
-//     let mut settings_occurences: HashMap<Settings, usize> = HashMap::new();
-
-//     let mut style_hash: HashMap<&'static str, Vec<StyleSetting>> = HashMap::new();
-//     for (settings, setting_info) in &settings_hash {
-//         let label = match &settings.foreground {
-//             Some(foreground) => match hex_to_hsb(foreground) {
-//                 Some((hue, sat, _)) => label_color_by_hue_sat(hue, sat),
-//                 None => "Misc",
-//             },
-//             None => "Misc",
-//         };
-
-//         let entry = style_hash.entry(label).or_insert_with(Vec::new);
-
-//         entry.push(StyleSetting {
-//             occurences: setting_info.occurences,
-//             foreground: settings.foreground.clone(),
-//             background: settings.background.clone(),
-//             font_style: settings.font_style.clone(),
-//         });
-//     }
-
-//     for (_, style_settings) in style_hash.iter_mut() {
-//         style_settings.sort_by(|a, b| b.occurences.cmp(&a.occurences));
-//     }
-
-//     // Sort the categories by their hue
-//     let mut sorted_categories: Vec<(&str, &Vec<StyleSetting>)> = style_hash
-//         .iter()
-//         .map(|(&key, value)| (key, value))
-//         .collect();
-
-//     sorted_categories.sort_by(|(category_a, _), (category_b, _)| {
-//         let hue_a = get_hue_by_label(&category_a);
-//         let hue_b = get_hue_by_label(&category_b);
-//         hue_a
-//             .partial_cmp(&hue_b)
-//             .unwrap_or(std::cmp::Ordering::Equal)
-//     });
-
-//     None
-// } else {
-//     None
-// }
 
 // [function definition]
 // meta.function
